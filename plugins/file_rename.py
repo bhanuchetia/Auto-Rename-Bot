@@ -8,7 +8,8 @@ from datetime import datetime
 from PIL import Image
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
-from pyrogram.types import InputMediaDocument, Message
+from pyrogram.types import (InputMediaDocument, Message, 
+                           InlineKeyboardMarkup, InlineKeyboardButton)
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 from plugins.antinsfw import check_anti_nsfw
@@ -60,39 +61,39 @@ AUDIO_PATTERNS = [
     (re.compile(r'\[(Unknown)\]'), lambda m: m.group(1))  # Added for [Unknown] tags
 ]
 
-def extract_season_episode(filename):
-    """Extract season and episode numbers from filename"""
+def extract_season_episode(text):
+    """Extract season and episode numbers from text"""
     for pattern in SEASON_EPISODE_PATTERNS:
-        match = pattern.search(filename)
+        match = pattern.search(text)
         if match:
             groups = match.groups()
             season = groups[0] if len(groups) > 0 else None
             episode = groups[1] if len(groups) > 1 else (groups[0] if len(groups) > 0 else None)
-            logger.info(f"Extracted season: {season}, episode: {episode} from {filename}")
+            logger.info(f"Extracted season: {season}, episode: {episode} from {text}")
             return season, episode
-    logger.warning(f"No season/episode pattern matched for {filename}")
+    logger.warning(f"No season/episode pattern matched for {text}")
     return None, None
 
-def extract_quality(filename):
-    """Extract quality information from filename"""
+def extract_quality(text):
+    """Extract quality information from text"""
     for pattern, extractor in QUALITY_PATTERNS:
-        match = pattern.search(filename)
+        match = pattern.search(text)
         if match:
             quality = extractor(match)
-            logger.info(f"Extracted quality: {quality} from {filename}")
+            logger.info(f"Extracted quality: {quality} from {text}")
             return quality
-    logger.warning(f"No quality pattern matched for {filename}")
+    logger.warning(f"No quality pattern matched for {text}")
     return "Unknown"
 
-def extract_audio_info(filename):
-    """Extract audio/language information from filename"""
+def extract_audio_info(text):
+    """Extract audio/language information from text"""
     for pattern, extractor in AUDIO_PATTERNS:
-        match = pattern.search(filename)
+        match = pattern.search(text)
         if match:
             audio_info = extractor(match)
-            logger.info(f"Extracted audio info: {audio_info} from {filename}")
+            logger.info(f"Extracted audio info: {audio_info} from {text}")
             return audio_info
-    logger.info(f"No audio pattern matched for {filename}")
+    logger.info(f"No audio pattern matched for {text}")
     return None
 
 async def cleanup_files(*paths):
@@ -167,12 +168,39 @@ async def add_metadata(input_path, output_path, user_id):
         process.kill()
         raise RuntimeError("FFmpeg processing timed out")
 
+@Client.on_message(filters.command(["renamesource"]) & filters.private)
+async def set_file_source(client, message):
+    """Set whether to extract patterns from filename or caption"""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Filename", callback_data="source_filename")],
+        [InlineKeyboardButton("Caption", callback_data="source_caption")]
+    ])
+    await message.reply_text(
+        "Select where to extract metadata patterns from:",
+        reply_markup=keyboard
+    )
+
+@Client.on_callback_query(filters.regex(r"^source_(filename|caption)$"))
+async def file_source_callback(client, callback_query):
+    """Handle file source selection"""
+    source_type = callback_query.data.split("_")[1]
+    user_id = callback_query.from_user.id
+    
+    try:
+        await codeflixbots.update_file_source(user_id, source_type)
+        await callback_query.answer(f"Patterns will now be extracted from {source_type}")
+        await callback_query.message.edit_text(f"✅ source set to: {source_type.upper()}")
+    except Exception as e:
+        logger.error(f"Error updating file source: {e}")
+        await callback_query.answer("Failed to update source preference")
+
 @Client.on_message(filters.private & (filters.document | filters.video | filters.audio))
 async def auto_rename_files(client, message):
     """Main handler for auto-renaming files"""
     user_id = message.from_user.id
     try:
         format_template = await codeflixbots.get_format_template(user_id)
+        source_type = await codeflixbots.get_file_source(user_id) or "filename"
     except Exception as e:
         logger.error(f"Database error: {e}")
         return await message.reply_text("Error accessing database. Please try again later.")
@@ -224,10 +252,13 @@ async def auto_rename_files(client, message):
     msg = None
 
     try:
-        # Extract metadata from filename
-        season, episode = extract_season_episode(file_name)
-        quality = extract_quality(file_name)
-        audio_info = extract_audio_info(file_name)
+        # Determine text to parse based on source type
+        text_to_parse = message.caption if source_type == "caption" and message.caption else file_name
+        
+        # Extract metadata from selected source
+        season, episode = extract_season_episode(text_to_parse)
+        quality = extract_quality(text_to_parse)
+        audio_info = extract_audio_info(text_to_parse)
         
         # Replace placeholders in template
         replacements = {
